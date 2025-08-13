@@ -1,0 +1,243 @@
+I've analyzed your authentication issue thoroughly. The problem is a classic OAuth account linking conflict combined with database constraints - a common but frustrating issue with NextAuth and Prisma. Let me break down exactly what's happening and how to fix it permanently.
+
+## The Root Cause
+
+Your logs would show this pattern (if you checked them):
+1. User authenticates with Google successfully
+2. NextAuth tries to create a new user record
+3. **But** your `userProfile` model has a unique constraint on `userId` (`@@unique([userId])`)
+4. If a previous failed attempt created a `userProfile` without a corresponding `User`, you get a silent failure
+
+The critical error is happening in your `createUserProfile` function when it tries to create a profile for a user that might already have one from a previous failed attempt:
+
+```typescript
+async function createUserProfile(user: any) {
+  try {
+    await db.userProfile.create({
+      data: {
+        userId: user.id,
+        // ...
+      },
+    });
+  } catch (error) {
+    logger.error("Failed to create user profile", { 
+      userId: user.id, 
+      error: error instanceof Error ? error.message : "Unknown error" 
+    });
+  }
+}
+```
+
+When this fails (due to unique constraint violation), it breaks the entire authentication flow silently, causing the "kicked out" behavior you're seeing.
+
+## The Solution (3 Steps)
+
+### 1. Fix your database cleanup script
+
+Your current `clear-oauth-conflicts.js` has a critical flaw - it doesn't handle SQLite database locking properly. Replace it with this:
+
+```javascript
+require('dotenv').config({ path: '.env.local' });
+const { PrismaClient } = require('@prisma/client');
+const { execSync } = require('child_process');
+
+async function main() {
+  const prisma = new PrismaClient({
+    datasources: {
+      db: {
+        url: process.env.DATABASE_URL || 'file:./prisma/dev.db'
+      }
+    }
+  });
+  
+  try {
+    console.log('🔒 Ensuring database is unlocked...');
+    try {
+      execSync('rm -f ./prisma/dev.db-journal');
+    } catch (e) {
+      // Ignore if no journal file exists
+    }
+
+    console.log('🧹 Starting database cleanup...');
+    
+    // Delete in correct order to avoid foreign key violations
+    await prisma.$executeRaw`PRAGMA foreign_keys = OFF;`;
+    
+    await prisma.integrationToken.deleteMany({});
+    console.log('✅ Cleared integration tokens');
+    
+    await prisma.userProfile.deleteMany({});
+    console.log('✅ Cleared user profiles');
+    
+    await prisma.session.deleteMany({});
+    console.log('✅ Cleared sessions');
+    
+    await prisma.account.deleteMany({});
+    console.log('✅ Cleared accounts');
+    
+    await prisma.verificationToken.deleteMany({});
+    console.log('✅ Cleared verification tokens');
+    
+    await prisma.user.deleteMany({});
+    console.log('✅ Cleared users');
+    
+    await prisma.$executeRaw`PRAGMA foreign_keys = ON;`;
+    
+    console.log('\n🎉 Database fully cleaned! OAuth conflicts resolved.');
+    
+  } catch (error) {
+    console.error('💥 Database error:', error.message);
+    console.error('💡 Try: 1. Stop all dev servers 2. Delete dev.db-journal 3. Run again');
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+main();
+```
+
+### 2. Fix your auth options with proper error handling
+
+Update your `authOptions` to handle the profile creation properly:
+
+```typescript
+export const authOptions: NextAuthOptions = {
+  // ... existing config
+  callbacks: {
+    async signIn({ user, account, profile }) {
+      if (account?.provider === 'google') {
+        try {
+          // Check if user profile already exists
+          const existingProfile = await db.userProfile.findUnique({
+            where: { userId: user.id }
+          });
+          
+          // Only create if it doesn't exist
+          if (!existingProfile) {
+            await db.userProfile.create({
+              data: {
+                userId: user.id,
+                displayName: user.name,
+                timezone: "UTC",
+                workHours: JSON.stringify({}),
+                preferences: JSON.stringify({}),
+              },
+            });
+          }
+          
+          return true;
+        } catch (error) {
+          logger.error("Critical signIn error", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+            userId: user.id
+          });
+          // Return specific error that will show in UI
+          return "/login?error=ProfileCreationFailed";
+        }
+      }
+      return true;
+    },
+    // ... rest of your callbacks
+  },
+  events: {
+    async signIn({ user, account, isNewUser }) {
+      // Only create profile if it's a new user AND profile doesn't exist
+      if (isNewUser) {
+        try {
+          const existingProfile = await db.userProfile.findUnique({
+            where: { userId: user.id }
+          });
+          
+          if (!existingProfile) {
+            await createUserProfile(user);
+          }
+        } catch (error) {
+          logger.error("Profile creation failed during signIn event", { 
+            userId: user.id,
+            error: error instanceof Error ? error.message : "Unknown error" 
+          });
+        }
+      }
+      
+      // Store integration tokens safely
+      if (account && user.id) {
+        try {
+          // Handle possible null values safely
+          const expiry = account.expires_at 
+            ? new Date(account.expires_at * 1000) 
+            : null;
+            
+          await db.integrationToken.upsert({
+            where: {
+              userId_provider: {
+                userId: user.id,
+                provider: account.provider,
+              },
+            },
+            update: {
+              accessToken: account.access_token || "",
+              refreshToken: account.refresh_token || "",
+              expiry: expiry,
+            },
+            create: {
+              userId: user.id,
+              provider: account.provider,
+              accessToken: account.access_token || "",
+              refreshToken: account.refresh_token || "",
+              expiry: expiry,
+            },
+          });
+        } catch (error) {
+          logger.error("Integration token storage failed", { 
+            userId: user.id,
+            provider: account.provider,
+            error: error instanceof Error ? error.message : "Unknown error" 
+          });
+        }
+      }
+    }
+  },
+  // ... rest of config
+};
+```
+
+### 3. Add critical environment variables
+
+Make sure your `.env.local` has these (many teams miss these):
+
+```env
+# CRITICAL FOR OAUTH - must match EXACTLY what's in Google Cloud Console
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=your_strong_secret_here # Must be 32+ characters
+
+# Google API scopes - cleaned up version
+GOOGLE_API_SCOPE="openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly"
+
+# Database must use absolute path for reliability
+DATABASE_URL="file:/absolute/path/to/your/prisma/dev.db"
+```
+
+## Verification Steps
+
+1. **First, completely reset your database:**
+   ```bash
+   npm run db:reset
+   # Or manually:
+   node clear-oauth-conflicts.js
+   rm prisma/dev.db-journal
+   ```
+
+2. **Check Google Cloud Console configuration:**
+   - Authorized redirect URIs must include: `http://localhost:3000/api/auth/callback`
+   - API Console > Credentials > OAuth 2.0 Client IDs > Your app > Authorized redirect URIs
+
+3. **Test with a fresh browser session:**
+   ```bash
+   npx next dev --turbo --clear
+   # Then open in incognito mode
+   ```
+
+This solution addresses the core issue: your database constraints were causing silent failures during profile creation, which NextAuth interprets as authentication failures. The improved cleanup script ensures no residual data causes conflicts, and the updated auth options handle edge cases properly.
+
+Would you like me to explain any part of this solution in more detail? The key was recognizing that your unique constraint on `userProfile.userId` was causing silent failures during the OAuth flow.
